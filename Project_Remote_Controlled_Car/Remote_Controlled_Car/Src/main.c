@@ -18,6 +18,20 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include <math.h>
+
+/* Function: blocking ADC read (12-bit) */
+static uint32_t ReadADCBlocking(ADC_HandleTypeDef *hadc) {
+  uint32_t val = 0;
+  HAL_ADC_Start(hadc);
+  if (HAL_ADC_PollForConversion(hadc, 10) == HAL_OK) {
+    val = HAL_ADC_GetValue(hadc);
+  }
+  HAL_ADC_Stop(hadc);
+  return val;
+}
+
+
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -118,46 +132,69 @@ HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1); // Motor B (PA5)
 
     /* USER CODE BEGIN 3 */
 
+  /* Joystick control loop
+   * ADC channels: hadc1 and hadc2 (configured in CubeMX)
+   * - Read both ADCs, map to [-1..1] with center ~2048 (12-bit ADC)
+   * - Compute differential drive: left = y + x, right = y - x
+   * - Set motor direction pins and PWM duty (0..htim.Init.Period)
+   */
+
+  const float deadzone = 0.05f; // small deadzone to avoid jitter
+  const uint32_t pwm_max = htim1.Init.Period; // assume both timers use same period (999)
+
   while (1)
-{
-    // === KJØR FREMOVER ===
-    HAL_GPIO_WritePin(GPIOB, IN_1A_Pin, GPIO_PIN_SET);   // Motor A frem
-    HAL_GPIO_WritePin(GPIOB, IN_1B_Pin, GPIO_PIN_SET);   // Motor B frem
-    HAL_GPIO_WritePin(GPIOB, IN_2B_Pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOB, IN_2A_Pin, GPIO_PIN_RESET);
+  {
+  uint32_t a1 = ReadADCBlocking(&hadc1); // e.g. X or Y
+  uint32_t a2 = ReadADCBlocking(&hadc2);
 
-    // ~25% hastighet
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 249);
-    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 249);
-    HAL_Delay(2000);
+    // Convert to -1..1 (12-bit ADC: 0..4095). Center ~2048
+    float x = ((float)a1 - 2048.0f) / 2048.0f;
+    float y = ((float)a2 - 2048.0f) / 2048.0f;
 
-    // ~75% hastighet
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 749);
-    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 749);
-    HAL_Delay(2000);
+    // apply deadzone
+    if (fabsf(x) < deadzone) x = 0.0f;
+    if (fabsf(y) < deadzone) y = 0.0f;
 
-    // === KJØR BAKOVER ===
-    HAL_GPIO_WritePin(GPIOB, IN_1A_Pin, GPIO_PIN_RESET);  // Motor A bak
-    HAL_GPIO_WritePin(GPIOB, IN_1B_Pin, GPIO_PIN_RESET);  // Motor B bak
-    HAL_GPIO_WritePin(GPIOB, IN_2A_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(GPIOB, IN_2B_Pin, GPIO_PIN_SET);
+    // differential mixing
+    float left = y + x;
+    float right = y - x;
 
-    // ~25% hastighet
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 249);
-    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 249);
-    HAL_Delay(2000);
+  // set max values within the range -1.0 to 1.0
+  if (left > 1.0f) left = 1.0f;
+  if (left < -1.0f) left = -1.0f;
+  if (right > 1.0f) right = 1.0f;
+  if (right < -1.0f) right = -1.0f;
 
-    // ~75% hastighet
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 749);
-    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 749);
-    HAL_Delay(2000);
+    // Motor A (left) -> TIM1_CH1 (PE9) ; Motor B (right) -> TIM2_CH1 (PA5)
+    // Direction pins: IN_1A/IN_2A for Motor A, IN_1B/IN_2B for Motor B
 
-    // === STOPP ===
-    HAL_GPIO_WritePin(GPIOB, IN_1A_Pin|IN_2A_Pin|IN_1B_Pin|IN_2B_Pin, GPIO_PIN_RESET);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);
-    HAL_Delay(2000);
-}
+    // Motor A direction
+    if (left >= 0.0f) {
+      HAL_GPIO_WritePin(GPIOB, IN_1A_Pin, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(GPIOB, IN_2A_Pin, GPIO_PIN_RESET);
+    } else {
+      HAL_GPIO_WritePin(GPIOB, IN_1A_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(GPIOB, IN_2A_Pin, GPIO_PIN_SET);
+    }
+
+    // Motor B direction
+    if (right >= 0.0f) {
+      HAL_GPIO_WritePin(GPIOB, IN_1B_Pin, GPIO_PIN_SET);
+      HAL_GPIO_WritePin(GPIOB, IN_2B_Pin, GPIO_PIN_RESET);
+    } else {
+      HAL_GPIO_WritePin(GPIOB, IN_1B_Pin, GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(GPIOB, IN_2B_Pin, GPIO_PIN_SET);
+    }
+
+    // Set PWM duty cycle
+    uint32_t cmpA = (uint32_t)(fminf(fabsf(left), 1.0f) * (float)pwm_max);
+    uint32_t cmpB = (uint32_t)(fminf(fabsf(right), 1.0f) * (float)pwm_max);
+
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, cmpA);
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, cmpB);
+
+    HAL_Delay(20); // ~50 Hz update
+  }
   }
   /* USER CODE END 3 */
 }
@@ -507,6 +544,7 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
@@ -515,6 +553,12 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, IN_1B_Pin|IN_2B_Pin|IN_1A_Pin|IN_2A_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PWR_BTN_Pin */
+  GPIO_InitStruct.Pin = PWR_BTN_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(PWR_BTN_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : IN_1B_Pin IN_2B_Pin IN_1A_Pin IN_2A_Pin */
   GPIO_InitStruct.Pin = IN_1B_Pin|IN_2B_Pin|IN_1A_Pin|IN_2A_Pin;
